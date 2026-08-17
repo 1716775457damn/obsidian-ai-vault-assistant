@@ -605,7 +605,7 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 	}
 
 	scanSkills() {
-		const out = [];
+		let out = [];
 		const dirs = this.getSkillsDirs();
 		try {
 			const fs = require("fs");
@@ -627,6 +627,8 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 				}
 			}
 		} catch (err) {}
+		const seen = new Set();
+		out = out.filter((s) => (seen.has(s.name) ? false : (seen.add(s.name), true)));
 		out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 		return out;
 	}
