@@ -794,6 +794,11 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 				},
 			},
 			{
+				name: "open_chat_view",
+				description: "在 Obsidian 中打开 AI 助手对话界面",
+				inputSchema: { type: "object", properties: {} },
+			},
+			{
 				name: "community_search",
 				description: "在 Obsidian 官方社区插件库中搜索插件",
 				inputSchema: {
@@ -1170,6 +1175,10 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 					await this.app.vault.adapter.write(target.path, nextStr);
 					return { ok: true, target: target.path, diff };
 				}
+				case "open_chat_view": {
+					const view = this.openChatView();
+					return { ok: true, opened: !!view };
+				}
 				default:
 					return { ok: false, error: "未知工具: " + name };
 			}
@@ -1286,7 +1295,20 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			this.app.workspace.revealLeaf(leaves[0]);
 			return leaves[0].view;
 		}
-		const leaf = this.app.workspace.getRightLeaf(false);
+		let leaf = null;
+		try {
+			if (this.app.workspace.getRightLeaf) leaf = this.app.workspace.getRightLeaf(false);
+		} catch (err) {}
+		if (!leaf) {
+			try {
+				if (this.app.workspace.getLeftLeaf) leaf = this.app.workspace.getLeftLeaf(false);
+			} catch (err) {}
+		}
+		if (!leaf && this.app.workspace.getLeaf) {
+			try {
+				leaf = this.app.workspace.getLeaf(true);
+			} catch (err) {}
+		}
 		if (!leaf) return null;
 		leaf.setViewState({ type: VIEW_TYPE, active: true });
 		this.app.workspace.revealLeaf(leaf);
@@ -2070,6 +2092,10 @@ class AIVaultAssistantSettingTab extends PluginSettingTab {
 			);
 
 		containerEl.createEl("h3", { text: "工具" });
+		new Setting(containerEl)
+			.setName("打开 AI 助手对话")
+			.setDesc("在当前窗口打开聊天界面（左侧 Ribbon 机器人图标也可用，或 Ctrl+P 搜命令）")
+			.addButton((b) => b.setButtonText("打开").setCta().onClick(() => this.plugin.openChatView()));
 		new Setting(containerEl)
 			.setName("搜索并安装社区插件")
 			.addButton((b) =>
