@@ -46,6 +46,23 @@ function uuid() {
 	return "id-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
+function copyText(text) {
+	try {
+		if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+			navigator.clipboard.writeText(text);
+			return true;
+		}
+	} catch (err) {}
+	try {
+		const electron = require("electron");
+		if (electron && electron.clipboard) {
+			electron.clipboard.writeText(text);
+			return true;
+		}
+	} catch (err) {}
+	return false;
+}
+
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -529,8 +546,13 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			try {
 				const url = this.settings.aiBaseUrl.replace(/\/+$/, "") + "/models";
 				const res = await requestUrl({ url, throw: false });
-				if (res.status === 200 && res.json && Array.isArray(res.json.models)) {
-					for (const m of res.json.models) {
+				let data = null;
+				if (res.status === 200) {
+					data = res.json;
+					if (!data) { try { data = JSON.parse(res.text); } catch (err) { data = null; } }
+				}
+				if (data && Array.isArray(data.models)) {
+					for (const m of data.models) {
 						const id = typeof m === "string" ? m : m && (m.id || m.slug || m.model);
 						if (id) proxyModels.push(id);
 					}
@@ -932,7 +954,8 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 				"AI 请求失败 (" + res.status + "): " + String(res.text || "").slice(0, 300)
 			);
 		}
-		const data = res.json;
+		let data = res.json;
+		if (!data) { try { data = JSON.parse(res.text); } catch (err) { data = {}; } }
 		const msg = data.choices && data.choices[0] && data.choices[0].message;
 		const content = (msg && msg.content) || "";
 		if (onDelta) onDelta(content);
@@ -1993,7 +2016,7 @@ class AIVaultAssistantSettingTab extends PluginSettingTab {
 			.addText((text) => text.setValue(this.plugin.settings.mcpToken).setDisabled(true))
 			.addButton((b) =>
 				b.setButtonText("复制").onClick(() => {
-					navigator.clipboard.writeText(this.plugin.settings.mcpToken);
+					copyText(this.plugin.settings.mcpToken);
 					new Notice("Token 已复制");
 				})
 			)
@@ -2017,7 +2040,7 @@ class AIVaultAssistantSettingTab extends PluginSettingTab {
 						'/mcp"\nheaders = { Authorization = "Bearer ' +
 						this.plugin.settings.mcpToken +
 						'" }';
-					navigator.clipboard.writeText(cfg);
+					copyText(cfg);
 					new Notice("Codex 配置已复制");
 				})
 			);
