@@ -26,6 +26,9 @@ const DEFAULT_SETTINGS = {
 	customModels: [],
 	maxTokens: 4096,
 	temperature: 0.3,
+	firstTokenTimeoutMs: 60000,
+	idleTimeoutMs: 30000,
+	totalTimeoutMs: 180000,
 	enableTools: true,
 	maxToolRounds: 6,
 	mcpEnabled: true,
@@ -65,6 +68,20 @@ function copyText(text) {
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 给 Promise 加超时（无法真正取消底层请求，仅用于防止界面无限等待）。
+ */
+function withTimeout(promise, ms, message) {
+	let timer = null;
+	const timeout = new Promise((_, reject) => {
+		timer = setTimeout(() => reject(new Error(message || "操作超时")), ms);
+	});
+	return Promise.race([promise, timeout]).then(
+		(v) => { clearTimeout(timer); return v; },
+		(e) => { clearTimeout(timer); throw e; }
+	);
 }
 
 /**
@@ -872,7 +889,8 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 				return await this.streamChatOnce(body, onDelta);
 			} catch (err) {
 				lastErr = err;
-				if (attempt >= 3) break;
+				const isTimeout = err && /超时/.test(err.message || "");
+				if (attempt >= 3 || isTimeout) break;
 				await sleep(1200 * attempt);
 			}
 		}
@@ -881,20 +899,44 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 
 	async streamChatOnce(body, onDelta) {
 		const url = this.settings.aiBaseUrl.replace(/\/+$/, "") + "/chat/completions";
-
-		// 优先走 fetch 流式
+		const firstTokenMs = this.settings.firstTokenTimeoutMs || 60000;
+		const idleMs = this.settings.idleTimeoutMs || 30000;
+		const totalMs = this.settings.totalTimeoutMs || 180000;
+		
+		// 优先走 fetch 流式（带超时控制，避免上游挂起时界面无限转圈）
 		if (typeof fetch === "function") {
+			const controller = new AbortController();
+			let firstTokenTimer = null;
+			let idleTimer = null;
+			let totalTimer = null;
+			let timedOut = false;
+			const clearTimers = () => {
+				if (firstTokenTimer) { clearTimeout(firstTokenTimer); firstTokenTimer = null; }
+				if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+				if (totalTimer) { clearTimeout(totalTimer); totalTimer = null; }
+			};
+			const abort = () => {
+				timedOut = true;
+				clearTimers();
+				try { controller.abort(); } catch (err) {}
+			};
 			try {
+				firstTokenTimer = setTimeout(abort, firstTokenMs);
+				totalTimer = setTimeout(abort, totalMs);
 				const resp = await fetch(url, {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify(body),
+					signal: controller.signal,
 				});
+				clearTimeout(firstTokenTimer);
+				firstTokenTimer = null;
 				if (!resp.ok) {
 					let detail = "";
 					try {
 						detail = (await resp.text()).slice(0, 300);
 					} catch (err) {}
+					clearTimers();
 					throw new Error("AI 请求失败 (" + resp.status + "): " + detail);
 				}
 				const reader = resp.body.getReader();
@@ -905,6 +947,8 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 				let toolIndex = -1;
 				const events = [];
 				for (;;) {
+					if (idleTimer) clearTimeout(idleTimer);
+					idleTimer = setTimeout(abort, idleMs);
 					const { done, value } = await reader.read();
 					if (done) break;
 					buffer += decoder.decode(value, { stream: true });
@@ -936,26 +980,37 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 					}
 					events.length = 0;
 				}
+				clearTimers();
 				return {
 					content,
 					tool_calls: toolCalls.length ? toolCalls : undefined,
 					finish_reason: "stop",
 				};
 			} catch (err) {
+				clearTimers();
+				if (timedOut || (err && err.name === "AbortError")) {
+					throw new Error(
+						"AI 请求超时（" + Math.round(firstTokenMs / 1000) + "s 未返回数据），请检查 cc-switch 代理与上游模型是否可用"
+					);
+				}
 				if (err && /请求失败/.test(err.message)) throw err;
 				// fetch 不可用/CSP 拦截 → 降级非流式
 				console.warn("[AI Vault Assistant] 流式请求失败，降级非流式:", err);
 			}
 		}
-
-		// 非流式降级
-		const res = await requestUrl({
-			url,
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(Object.assign({}, body, { stream: false })),
-			throw: false,
-		});
+		
+		// 非流式降级（requestUrl 无取消机制，用竞速兜底，避免界面无限转圈）
+		const res = await withTimeout(
+			requestUrl({
+				url,
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(Object.assign({}, body, { stream: false })),
+				throw: false,
+			}),
+			totalMs,
+			"AI 请求超时（非流式，请检查 cc-switch 代理与上游）"
+		);
 		if (res.status !== 200) {
 			throw new Error(
 				"AI 请求失败 (" + res.status + "): " + String(res.text || "").slice(0, 300)
@@ -972,8 +1027,7 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			finish_reason: data.choices && data.choices[0] && data.choices[0].finish_reason,
 		};
 	}
-
-	async callAI(message, system, model) {
+		async callAI(message, system, model) {
 		const messages = [];
 		if (system) messages.push({ role: "system", content: system });
 		messages.push({ role: "user", content: message || "" });
@@ -1978,7 +2032,50 @@ class AIVaultAssistantSettingTab extends PluginSettingTab {
 					})
 			);
 
+		containerEl.createEl("h3", { text: "AI 超时设置" });
 		new Setting(containerEl)
+			.setName("首 token 超时（秒）")
+			.setDesc("请求发出后多久未收到首个数据即判定超时（默认 60）")
+			.addText((text) =>
+				text
+					.setValue(String(Math.round(this.plugin.settings.firstTokenTimeoutMs / 1000) || 60))
+					.onChange(async (v) => {
+						const s = parseInt(v, 10);
+						if (s > 0 && s <= 600) {
+							this.plugin.settings.firstTokenTimeoutMs = s * 1000;
+							await this.plugin.saveSettings();
+						}
+					})
+			);
+		new Setting(containerEl)
+			.setName("流式空闲超时（秒）")
+			.setDesc("流式输出中相邻数据间隔超过该时长即判定超时（默认 30）")
+			.addText((text) =>
+				text
+					.setValue(String(Math.round(this.plugin.settings.idleTimeoutMs / 1000) || 30))
+					.onChange(async (v) => {
+						const s = parseInt(v, 10);
+						if (s > 0 && s <= 600) {
+							this.plugin.settings.idleTimeoutMs = s * 1000;
+							await this.plugin.saveSettings();
+						}
+					})
+			);
+		new Setting(containerEl)
+			.setName("总超时（秒）")
+			.setDesc("单次 AI 请求最长等待时间（默认 180）")
+			.addText((text) =>
+				text
+					.setValue(String(Math.round(this.plugin.settings.totalTimeoutMs / 1000) || 180))
+					.onChange(async (v) => {
+						const s = parseInt(v, 10);
+						if (s > 0 && s <= 3600) {
+							this.plugin.settings.totalTimeoutMs = s * 1000;
+							await this.plugin.saveSettings();
+						}
+					})
+			);
+				new Setting(containerEl)
 			.setName("cc-switch 数据目录")
 			.setDesc("用于读取 settings.json / cc-switch.db / skills。留空则自动探测")
 			.addText((text) =>
@@ -2120,4 +2217,5 @@ module.exports.helpers = {
 	buildVaultIndex,
 	makeDiff,
 	jsonRpcError,
+	withTimeout,
 };

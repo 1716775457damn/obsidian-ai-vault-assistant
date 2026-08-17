@@ -17,7 +17,7 @@
 
 3. **内置 Skills + 开放 MCP 服务**
    - 自动扫描本地 skills：`<cc-switch>/skills`、`~/.codex/skills`、`~/.agents/skills`，注入 AI 系统提示，可通过 `skill_read` 读取全文。
-   - 内置本地 HTTP MCP 服务（默认 `127.0.0.1:33157/mcp`，Bearer Token 鉴权），暴露 14 个工具，供 **Codex** 等外部 Agent 接入。
+   - 内置本地 HTTP MCP 服务（默认 `127.0.0.1:33157/mcp`，Bearer Token 鉴权），暴露 15 个工具，供 **Codex** 等外部 Agent 接入。
 
 4. **对话界面：整理、互链、装插件、改配置**
    - Ribbon 图标 / 命令面板打开对话视图；支持 Markdown 渲染与流式打字效果。
