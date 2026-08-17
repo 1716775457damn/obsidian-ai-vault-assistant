@@ -1,0 +1,9 @@
+{
+	"id": "ai-vault-assistant",
+	"name": "AI Vault Assistant",
+	"version": "1.0.0",
+	"minAppVersion": "1.4.0",
+	"description": "接入 cc-switch 本地代理使用 AI：对话整理 Vault、构建相互关联的笔记、列出插件与命令、内置 Skills、开放 MCP 服务供 Codex 等外部 Agent 接入、推荐并安装社区插件、经确认后修改插件配置。",
+	"author": "1716775457damn",
+	"isDesktopOnly": true
+}
