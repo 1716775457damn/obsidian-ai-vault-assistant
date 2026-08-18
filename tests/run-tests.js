@@ -102,6 +102,9 @@ function assert(cond, msg) {
 	assert(helpers.DEFAULT_SETTINGS.firstTokenTimeoutMs === 60000, "默认首 token 超时 60s");
 	assert(helpers.DEFAULT_SETTINGS.idleTimeoutMs === 30000, "默认空闲超时 30s");
 	assert(helpers.DEFAULT_SETTINGS.totalTimeoutMs === 180000, "默认总超时 180s");
+	assert(helpers.DEFAULT_SETTINGS.maxHistoryMessages === 40, "默认历史 40 条");
+	assert(helpers.DEFAULT_SETTINGS.aiConcurrentLimit === 2, "默认 AI 并发 2");
+	assert(helpers.DEFAULT_SETTINGS.vaultReadMaxBytes === 500000, "默认读取上限 500KB");
 }
 
 
@@ -118,6 +121,39 @@ function assert(cond, msg) {
 		assert(!helpers.isSafeVaultPath("./a.md"), "isSafeVaultPath 拒绝 ./");
 		assert(!helpers.isSafeVaultPath(""), "isSafeVaultPath 拒绝空串");
 		assert(!helpers.isSafeVaultPath(null), "isSafeVaultPath 拒绝 null");
+	}
+
+	// vault_read 大文件截断
+	{
+		const cls = sandbox.module.exports;
+		const inst = Object.create(cls.prototype);
+		inst.settings = { vaultReadMaxBytes: 100 };
+		inst.app = { vault: { adapter: { exists: async () => true, read: async () => "x".repeat(500) } } };
+		const r = await inst.runTool("vault_read", { path: "big.md" }, { confirmMode: "required" });
+		assert(r.ok === true && r.truncated === true && r.content.length < 500, "vault_read 大文件截断");
+	}
+
+	// AI 并发限制：第三个请求等待/失败
+	{
+		const cls = sandbox.module.exports;
+		const inst = Object.create(cls.prototype);
+		inst.settings = { aiConcurrentLimit: 1, aiBaseUrl: "http://x/v1", maxTokens: 16, temperature: 0.3, enableTools: false, firstTokenTimeoutMs: 60000, idleTimeoutMs: 30000, totalTimeoutMs: 180000 };
+		let inflight = 0;
+		sandbox.fetch = async () => {
+			inflight++;
+			const encoder = new TextEncoder();
+			const stream = new ReadableStream({
+				start(c) { setTimeout(() => { c.enqueue(encoder.encode("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")); c.enqueue(encoder.encode("data: [DONE]\n\n")); c.close(); }, 30); },
+			});
+			return { ok: true, status: 200, text: async () => "", body: { getReader: () => stream.getReader() } };
+		};
+		const p1 = inst.streamChat([{ role: "user", content: "a" }], { tools: false });
+		await new Promise((r) => setTimeout(r, 10));
+		const p2 = inst.streamChat([{ role: "user", content: "b" }], { tools: false });
+		await new Promise((r) => setTimeout(r, 50));
+		assert(inflight <= 1, "AI 并发限制：同时最多 1 个请求");
+		await Promise.all([p1, p2]);
+		assert(inflight === 2, "AI 并发限制：两个请求都完成");
 	}
 
 	// runTool 路径穿越拒绝

@@ -31,6 +31,9 @@ const DEFAULT_SETTINGS = {
 	totalTimeoutMs: 180000,
 	enableTools: true,
 	maxToolRounds: 6,
+	maxHistoryMessages: 40,
+	aiConcurrentLimit: 2,
+	vaultReadMaxBytes: 500000,
 	mcpEnabled: true,
 	mcpPort: 33157,
 	mcpToken: "",
@@ -216,12 +219,16 @@ async function requestJson(url) {
 	}
 }
 
-async function requestBinary(url) {
+async function requestBinary(url, maxBytes) {
 	const res = await requestUrl({ url, throw: false });
 	if (res.status !== 200) {
 		throw new Error("下载失败 " + res.status + ": " + url);
 	}
-	return res.arrayBuffer;
+	const buf = res.arrayBuffer;
+	if (maxBytes && buf && buf.byteLength > maxBytes) {
+		throw new Error("下载文件过大（" + buf.byteLength + "B 超过上限 " + maxBytes + "B）: " + url);
+	}
+	return buf;
 }
 const MODEL_CATALOG = [
 	["claude-3-5-haiku-20241022", "Claude 3.5 Haiku"],
@@ -483,6 +490,14 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 	// ---------- Vault / 插件 / 命令 枚举 ----------
 
 	async listVaultFiles(includeStat) {
+		if (
+			includeStat &&
+			this.vaultIndexCache &&
+			this.vaultIndexCacheAt &&
+			Date.now() - this.vaultIndexCacheAt < 30000
+		) {
+			return this.vaultIndexCache;
+		}
 		const files = this.app.vault.getFiles();
 		const out = [];
 		for (const f of files) {
@@ -497,6 +512,10 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			out.push(item);
 		}
 		out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+		if (includeStat) {
+			this.vaultIndexCache = out;
+			this.vaultIndexCacheAt = Date.now();
+		}
 		return out;
 	}
 
@@ -895,20 +914,34 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 		};
 		if (useTools) body.tools = this.buildToolsSpec();
 
+		// AI 并发限制：防止外部 agent 同时打爆上游
+		const limit = this.settings.aiConcurrentLimit || 2;
+		let waited = 0;
+		while ((this.aiInFlight || 0) >= limit) {
+			if (waited >= 60000) throw new Error("AI 请求繁忙（并发上限 " + limit + "），请稍后再试");
+			await sleep(200);
+			waited += 200;
+		}
+		this.aiInFlight = (this.aiInFlight || 0) + 1;
+
 		let attempt = 0;
 		let lastErr = null;
-		while (attempt < 3) {
-			attempt++;
-			try {
-				return await this.streamChatOnce(body, onDelta);
-			} catch (err) {
-				lastErr = err;
-				const isTimeout = err && /超时/.test(err.message || "");
-				if (attempt >= 3 || isTimeout) break;
-				await sleep(1200 * attempt);
+		try {
+			while (attempt < 3) {
+				attempt++;
+				try {
+					return await this.streamChatOnce(body, onDelta);
+				} catch (err) {
+					lastErr = err;
+					const isTimeout = err && /超时/.test(err.message || "");
+					if (attempt >= 3 || isTimeout) break;
+					await sleep(1200 * attempt);
+				}
 			}
+			throw lastErr || new Error("AI 请求失败");
+		} finally {
+			this.aiInFlight = Math.max(0, (this.aiInFlight || 0) - 1);
 		}
-		throw lastErr || new Error("AI 请求失败");
 	}
 
 	async streamChatOnce(body, onDelta) {
@@ -1084,7 +1117,10 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			switch (name) {
 				case "vault_tree": {
 					const files = await this.listVaultFiles(true);
-					const max = (args && args.max) || this.settings.vaultTreeMaxEntries;
+					const max = Math.min(
+						Math.max(parseInt((args && args.max), 10) || this.settings.vaultTreeMaxEntries, 1),
+						5000
+					);
 					return {
 						ok: true,
 						count: files.length,
@@ -1104,7 +1140,14 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 						return { ok: false, error: "文件不存在: " + norm };
 					}
 					const content = await this.app.vault.adapter.read(norm);
-					return { ok: true, path: norm, content, size: content.length };
+					const maxBytes = this.settings.vaultReadMaxBytes || 500000;
+					let contentOut = content;
+					let truncated = false;
+					if (content.length > maxBytes) {
+						contentOut = content.slice(0, maxBytes) + "\n…（内容过长已截断）";
+						truncated = true;
+					}
+					return { ok: true, path: norm, content: contentOut, size: content.length, truncated };
 				}
 				case "vault_search": {
 					const q = String((args && args.query) || "").toLowerCase();
@@ -1295,7 +1338,13 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 	async getCommunityRegistry() {
 		const now = Date.now();
 		if (!this.registryCache || !this.registryCacheAt || now - this.registryCacheAt > 6 * 3600 * 1000) {
-			const res = await requestUrl({ url: COMMUNITY_PLUGINS_URL, throw: false });
+			let res = await requestUrl({ url: COMMUNITY_PLUGINS_URL, throw: false });
+			if (res.status !== 200) {
+				res = await requestUrl({
+					url: "https://cdn.jsdelivr.net/gh/obsidianmd/obsidian-releases@master/community-plugins.json",
+					throw: false,
+				});
+			}
 			if (res.status === 200) {
 				try {
 					this.registryCache = JSON.parse(res.text);
@@ -1347,11 +1396,27 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 		const adapter = this.app.vault.adapter;
 		const dir = normalizePath(".obsidian/plugins/" + id);
 		const downloaded = [];
+		const sizeLimit = { "main.js": 10 * 1024 * 1024, "manifest.json": 1024 * 1024, "styles.css": 2 * 1024 * 1024 };
 		for (const name of ["main.js", "manifest.json", "styles.css"]) {
 			if (!assetNames.has(name)) continue;
+			const asset = release.assets.find((a) => a.name === name);
+			if (asset && asset.size > (sizeLimit[name] || 10 * 1024 * 1024)) {
+				throw new Error("发布包 " + name + " 过大（" + asset.size + "B），已拒绝下载");
+			}
 			const buf = await requestBinary(
-				"https://github.com/" + entry.repo + "/releases/download/" + encodeURIComponent(tag) + "/" + name
+				"https://github.com/" + entry.repo + "/releases/download/" + encodeURIComponent(tag) + "/" + name,
+				sizeLimit[name] || 10 * 1024 * 1024
 			);
+			if (name === "manifest.json") {
+				try {
+					const m = JSON.parse(new TextDecoder("utf-8").decode(buf));
+					if (m && m.id && m.id !== id) {
+						throw new Error("发布包 manifest.id（" + m.id + "）与插件 " + id + " 不符，已拒绝安装");
+					}
+				} catch (err) {
+					if (err && err.message && /不符/.test(err.message)) throw err;
+				}
+			}
 			await adapter.writeBinary(normalizePath(dir + "/" + name), buf);
 			downloaded.push(name);
 		}
@@ -1374,8 +1439,14 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 
 	confirmModal(title, message) {
 		return new Promise((resolve) => {
-			const modal = new Modal(this.app);
-			modal.titleEl.setText(title);
+		const modal = new Modal(this.app);
+		const timer = setTimeout(() => {
+			try {
+				modal.close();
+			} catch (err) {}
+			resolve(false);
+		}, 120000);
+		modal.titleEl.setText(title);
 			const content = modal.contentEl;
 			content.createEl("pre", { text: message, cls: "ava-confirm-text" });
 			const btnRow = content.createDiv({ cls: "ava-confirm-buttons" });
@@ -1389,7 +1460,10 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 				modal.close();
 				resolve(true);
 			});
-			modal.onClose = () => resolve(false);
+		modal.onClose = () => {
+			clearTimeout(timer);
+			resolve(false);
+		};
 			modal.open();
 		});
 	}
@@ -1818,7 +1892,8 @@ class ChatView extends ItemView {
 
 		try {
 			const system = await this.plugin.buildSystemPrompt();
-			const messages = [{ role: "system", content: system }, ...this.history];
+			const hist = this.history.slice(-(this.plugin.settings.maxHistoryMessages || 40));
+			const messages = [{ role: "system", content: system }, ...hist];
 
 			for (
 				let round = 0;
@@ -1856,10 +1931,14 @@ class ChatView extends ItemView {
 							cls: "ava-tool-result",
 						});
 						this.scrollToBottom();
+						const toolResult = JSON.stringify(result);
 						messages.push({
 							role: "tool",
 							tool_call_id: tc.id,
-							content: JSON.stringify(result),
+							content:
+								toolResult.length > 6000
+								? toolResult.slice(0, 6000) + "\n…（工具结果过长已截断）"
+								: toolResult,
 						});
 					}
 					full = "";
