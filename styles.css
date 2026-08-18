@@ -263,3 +263,13 @@
 	font-size: 0.9em;
 	color: var(--text-normal);
 }
+
+.ava-warn {
+	background: var(--background-modifier-error, rgba(255, 0, 0, 0.08));
+	color: var(--text-error, #e03131);
+	border: 1px solid var(--background-modifier-error-hover, rgba(255, 0, 0, 0.3));
+	border-radius: 6px;
+	padding: 8px 10px;
+	margin-bottom: 12px;
+	font-size: 0.9em;
+}

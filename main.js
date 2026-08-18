@@ -119,6 +119,20 @@ function uniqueStrings(arr) {
 	}
 	return out;
 }
+/**
+ * 校验路径是否安全落在 vault 内：拒绝绝对路径、盘符、反斜杠、./.. 段与空段。
+ */
+function isSafeVaultPath(p) {
+	if (typeof p !== "string" || !p) return false;
+	if (p.includes("\\")) return false;
+	if (p.startsWith("/") || p.startsWith("./")) return false;
+	if (/^[a-zA-Z]:/.test(p)) return false;
+	for (const s of p.split("/")) {
+		if (!s || s === "." || s === "..") return false;
+	}
+	return true;
+}
+
 
 /** 从 cc-switch.db 原始文本中提取配置过的模型名（无需 SQLite 解析） */
 function extractDbModels(rawText) {
@@ -1038,10 +1052,13 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 	// ---------- 工具执行 ----------
 
 	resolveConfigTarget(target) {
-		if (!target) return null;
-		if (typeof target === "string" && (target.startsWith(".obsidian/") || target.startsWith(".obsidian\\"))) {
-			return { path: normalizePath(target), kind: "file" };
+		if (typeof target !== "string" || !target) return null;
+		if (target.startsWith(".obsidian/")) {
+			const p = normalizePath(target);
+			if (!isSafeVaultPath(p) || !/\.json$/i.test(p)) return null;
+			return { path: p, kind: "file" };
 		}
+		if (!/^[a-zA-Z0-9][a-zA-Z0-9-_]*$/.test(target)) return null;
 		return { path: normalizePath(".obsidian/plugins/" + target + "/data.json"), kind: "plugin" };
 	}
 
@@ -1079,6 +1096,10 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 				case "vault_read": {
 					if (!args || !args.path) return { ok: false, error: "缺少 path" };
 					const norm = normalizePath(args.path);
+					if (!isSafeVaultPath(norm)) return { ok: false, error: "非法路径（仅允许 vault 内相对路径）: " + norm };
+					if (norm.startsWith(".obsidian/")) {
+						return { ok: false, error: "读取 .obsidian 配置请用 config_read" };
+					}
 					if (!(await this.app.vault.adapter.exists(norm))) {
 						return { ok: false, error: "文件不存在: " + norm };
 					}
@@ -1123,6 +1144,10 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 						return { ok: false, error: "缺少 path/content" };
 					}
 					const norm = normalizePath(args.path);
+					if (!isSafeVaultPath(norm)) return { ok: false, error: "非法路径（仅允许 vault 内相对路径）: " + norm };
+					if (norm.startsWith(".obsidian/")) {
+						return { ok: false, error: "禁止直接写 .obsidian 配置区，请用 config_apply" };
+					}
 					const exists = await this.app.vault.adapter.exists(norm);
 					const mode = args.mode || (exists ? "overwrite" : "create");
 					if (mode === "create" && exists) {
@@ -1144,6 +1169,10 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 					const fromPath = normalizePath((args && args.fromPath) || "");
 					const toPath = (args && args.toPath) || "";
 					if (!fromPath || !toPath) return { ok: false, error: "缺少 fromPath/toPath" };
+					if (!isSafeVaultPath(fromPath)) return { ok: false, error: "非法路径（仅允许 vault 内相对路径）: " + fromPath };
+					if (fromPath.startsWith(".obsidian/")) {
+						return { ok: false, error: "禁止直接改 .obsidian 配置区" };
+					}
 					const link = "[[" + toPath + (args.label ? "|" + args.label : "") + "]]";
 					const c = await needConfirm("在 " + fromPath + " 末尾追加 wikilink → " + link);
 					if (c) return c;
@@ -1206,6 +1235,16 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 					try {
 						parsed = JSON.parse(content);
 					} catch (err) {}
+					if (target.path.endsWith("/plugins/ai-vault-assistant/data.json")) {
+						try {
+							const obj = JSON.parse(content);
+							if (obj && obj.mcpToken) {
+								obj.mcpToken = "***";
+								parsed = obj;
+								return { ok: true, target: target.path, content: JSON.stringify(obj, null, "\t"), parsed, redacted: ["mcpToken"] };
+							}
+						} catch (err) {}
+					}
 					return { ok: true, target: target.path, content, parsed };
 				}
 				case "config_apply": {
@@ -1222,6 +1261,16 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 						} catch (err) {
 							return { ok: false, error: "next 无法序列化" };
 						}
+					}
+					if (target.path.endsWith("/plugins/ai-vault-assistant/data.json")) {
+						try {
+							const nextObj = JSON.parse(nextStr);
+							if (nextObj && nextObj.mcpToken === "***") {
+								const curObj = cur ? JSON.parse(cur) : {};
+								if (curObj && curObj.mcpToken) nextObj.mcpToken = curObj.mcpToken;
+								nextStr = JSON.stringify(nextObj, null, "\t");
+							}
+						} catch (err) {}
 					}
 					const diff = makeDiff(cur, nextStr);
 					const c = await needConfirm("修改配置 " + target.path + "：\n\n" + diff.slice(0, 2000));
@@ -1244,7 +1293,8 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 	// ---------- 社区插件 ----------
 
 	async getCommunityRegistry() {
-		if (!this.registryCache) {
+		const now = Date.now();
+		if (!this.registryCache || !this.registryCacheAt || now - this.registryCacheAt > 6 * 3600 * 1000) {
 			const res = await requestUrl({ url: COMMUNITY_PLUGINS_URL, throw: false });
 			if (res.status === 200) {
 				try {
@@ -1255,6 +1305,7 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			} else {
 				this.registryCache = [];
 			}
+			this.registryCacheAt = now;
 		}
 		return this.registryCache;
 	}
@@ -1501,11 +1552,15 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			}
 		}
 		let raw = "";
+		let tooLarge = false;
 		req.setEncoding("utf8");
 		req.on("data", (d) => {
+			if (tooLarge) return;
 			raw += d;
 			if (raw.length > 2 * 1024 * 1024) {
-				res.destroy();
+				tooLarge = true;
+				this.mcpJson(res, 413, jsonRpcError(null, -32000, "请求体过大（上限 2MB）"));
+				req.destroy();
 			}
 		});
 		req.on("end", () => {
@@ -1986,6 +2041,10 @@ class AIVaultAssistantSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
+		containerEl.createEl("div", {
+			cls: "ava-warn",
+			text: "⚠️ 隐私提示：AI 对话会把笔记内容发送到 aiBaseUrl 指向的模型服务（cc-switch 代理 → 上游模型）。使用公共/第三方上游时请勿放入敏感笔记，建议改用本地或私有模型。",
+		});
 		containerEl.createEl("h3", { text: "cc-switch 状态" });
 		const info = containerEl.createDiv({ cls: "ava-cc-info" });
 		const cc = this.plugin.readCCSwitchSettings();
@@ -2218,4 +2277,5 @@ module.exports.helpers = {
 	makeDiff,
 	jsonRpcError,
 	withTimeout,
+	isSafeVaultPath,
 };

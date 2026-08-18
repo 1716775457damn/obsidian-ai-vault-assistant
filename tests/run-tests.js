@@ -106,6 +106,40 @@ function assert(cond, msg) {
 
 
 (async () => {
+	// isSafeVaultPath
+	{
+		assert(helpers.isSafeVaultPath("a/b.md"), "isSafeVaultPath 合法路径");
+		assert(helpers.isSafeVaultPath("文件夹/笔记.md"), "isSafeVaultPath 中文路径");
+		assert(!helpers.isSafeVaultPath("../a.md"), "isSafeVaultPath 拒绝 ..");
+		assert(!helpers.isSafeVaultPath("a/../b.md"), "isSafeVaultPath 拒绝中间 ..");
+		assert(!helpers.isSafeVaultPath("C:/x.md"), "isSafeVaultPath 拒绝盘符");
+		assert(!helpers.isSafeVaultPath("/abs/x.md"), "isSafeVaultPath 拒绝绝对路径");
+		assert(!helpers.isSafeVaultPath("a\\b.md"), "isSafeVaultPath 拒绝反斜杠");
+		assert(!helpers.isSafeVaultPath("./a.md"), "isSafeVaultPath 拒绝 ./");
+		assert(!helpers.isSafeVaultPath(""), "isSafeVaultPath 拒绝空串");
+		assert(!helpers.isSafeVaultPath(null), "isSafeVaultPath 拒绝 null");
+	}
+
+	// runTool 路径穿越拒绝
+	{
+		const cls = sandbox.module.exports;
+		const inst = Object.create(cls.prototype);
+		inst.settings = {};
+		inst.app = { vault: { adapter: { exists: async () => false, read: async () => "", write: async () => {} } } };
+		const r1 = await inst.runTool("vault_read", { path: "../../x.md" }, { confirmMode: "required" });
+		assert(r1.ok === false && /路径/.test(r1.error), "vault_read 拒绝 ../");
+		const r2 = await inst.runTool("vault_write", { path: "../../x.md", content: "x", confirm: true }, { confirmMode: "required" });
+		assert(r2.ok === false && /路径/.test(r2.error), "vault_write 拒绝 ../");
+		const r3 = await inst.runTool("vault_write", { path: ".obsidian/app.json", content: "{}", confirm: true }, { confirmMode: "required" });
+		assert(r3.ok === false && /config_apply/.test(r3.error), "vault_write 拒绝写 .obsidian");
+		const r4 = await inst.runTool("config_read", { target: "../../x" }, { confirmMode: "required" });
+		assert(r4.ok === false, "config_read 拒绝穿越 target");
+		const r5 = await inst.runTool("config_apply", { target: "a/../b", next: "{}", confirm: true }, { confirmMode: "required" });
+		assert(r5.ok === false, "config_apply 拒绝穿越 target");
+		const r6 = await inst.runTool("config_apply", { target: "bad target!", next: "{}", confirm: true }, { confirmMode: "required" });
+		assert(r6.ok === false, "config_apply 拒绝非法插件 id");
+	}
+
 	// withTimeout 正常 resolve
 	{
 		const v = await helpers.withTimeout(Promise.resolve(42), 500, "x");
