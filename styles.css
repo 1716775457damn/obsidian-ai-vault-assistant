@@ -53,6 +53,22 @@
 	border-color: var(--interactive-accent);
 }
 
+.ava-btn.ava-stop {
+	border-color: var(--color-red, #e5484d);
+	color: var(--color-red, #e5484d);
+}
+
+.ava-btn.ava-stop:hover {
+	background: var(--color-red, #e5484d);
+	border-color: var(--color-red, #e5484d);
+	color: var(--background-primary, #fff);
+}
+
+.ava-send:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
 .ava-messages {
 	flex: 1;
 	overflow-y: auto;

@@ -43,6 +43,7 @@ const DEFAULT_SETTINGS = {
 	includeCommands: true,
 	vaultTreeMaxEntries: 900,
 	lastModelRefresh: 0,
+	chatHistory: [],
 };
 
 function uuid() {
@@ -904,6 +905,7 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 
 	async streamChat(messages, opts, onDelta) {
 		const model = (opts && opts.model) || this.settings.model;
+		const stopSignal = opts && opts.stopSignal;
 		const useTools = this.settings.enableTools && (!opts || opts.tools !== false);
 		const body = {
 			model,
@@ -930,11 +932,12 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			while (attempt < 3) {
 				attempt++;
 				try {
-					return await this.streamChatOnce(body, onDelta);
+					return await this.streamChatOnce(body, onDelta, stopSignal);
 				} catch (err) {
 					lastErr = err;
 					const isTimeout = err && /超时/.test(err.message || "");
-					if (attempt >= 3 || isTimeout) break;
+					const isStop = err && /已停止/.test(err.message || "");
+					if (attempt >= 3 || isTimeout || isStop) break;
 					await sleep(1200 * attempt);
 				}
 			}
@@ -944,7 +947,7 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 		}
 	}
 
-	async streamChatOnce(body, onDelta) {
+	async streamChatOnce(body, onDelta, stopSignal) {
 		const url = this.settings.aiBaseUrl.replace(/\/+$/, "") + "/chat/completions";
 		const firstTokenMs = this.settings.firstTokenTimeoutMs || 60000;
 		const idleMs = this.settings.idleTimeoutMs || 30000;
@@ -957,16 +960,27 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 			let idleTimer = null;
 			let totalTimer = null;
 			let timedOut = false;
+			let stopped = false;
 			const clearTimers = () => {
 				if (firstTokenTimer) { clearTimeout(firstTokenTimer); firstTokenTimer = null; }
 				if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
 				if (totalTimer) { clearTimeout(totalTimer); totalTimer = null; }
+				if (stopHandler && stopSignal && stopSignal.removeEventListener) {
+					try { stopSignal.removeEventListener("abort", stopHandler); } catch (err) {}
+				}
 			};
 			const abort = () => {
 				timedOut = true;
 				clearTimers();
 				try { controller.abort(); } catch (err) {}
 			};
+			let stopHandler = null;
+			if (stopSignal && typeof stopSignal.addEventListener === "function") {
+				stopHandler = () => { stopped = true; abort(); };
+				if (stopSignal.aborted) stopHandler();
+				else stopSignal.addEventListener("abort", stopHandler, { once: true });
+			}
+			if (stopped) throw new Error("已停止生成");
 			try {
 				firstTokenTimer = setTimeout(abort, firstTokenMs);
 				totalTimer = setTimeout(abort, totalMs);
@@ -1006,7 +1020,11 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 						const delta = choice.delta || {};
 						if (delta.content) {
 							content += delta.content;
-							if (onDelta) onDelta(delta.content);
+							if (onDelta && onDelta(delta.content) === false) {
+								stopped = true;
+								abort();
+								break;
+							}
 						}
 						if (delta.tool_calls) {
 							for (const tc of delta.tool_calls) {
@@ -1026,8 +1044,10 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 						}
 					}
 					events.length = 0;
+					if (stopped) break;
 				}
 				clearTimers();
+				if (stopped) throw new Error("已停止生成");
 				return {
 					content,
 					tool_calls: toolCalls.length ? toolCalls : undefined,
@@ -1035,6 +1055,9 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 				};
 			} catch (err) {
 				clearTimers();
+				if (stopped) {
+					throw new Error("已停止生成");
+				}
 				if (timedOut || (err && err.name === "AbortError")) {
 					throw new Error(
 						"AI 请求超时（" + Math.round(firstTokenMs / 1000) + "s 未返回数据），请检查 cc-switch 代理与上游模型是否可用"
@@ -1067,7 +1090,9 @@ module.exports = class AIVaultAssistantPlugin extends Plugin {
 		if (!data) { try { data = JSON.parse(res.text); } catch (err) { data = {}; } }
 		const msg = data.choices && data.choices[0] && data.choices[0].message;
 		const content = (msg && msg.content) || "";
-		if (onDelta) onDelta(content);
+		if (onDelta && onDelta(content) === false) {
+			throw new Error("已停止生成");
+		}
 		return {
 			content,
 			tool_calls: msg && msg.tool_calls,
@@ -1724,6 +1749,9 @@ class ChatView extends ItemView {
 		super(leaf);
 		this.plugin = plugin;
 		this.history = [];
+		this.stopping = false;
+		this.busy = false;
+		this.stopController = null;
 	}
 
 	getViewType() {
@@ -1782,8 +1810,11 @@ class ChatView extends ItemView {
 			cls: "ava-input",
 			attr: { placeholder: "输入消息…（Enter 发送，Shift+Enter 换行）", rows: "3" },
 		});
-		const sendBtn = inputBar.createEl("button", { text: "发送", cls: "ava-send mod-cta" });
-		sendBtn.addEventListener("click", () => this.onSend());
+		this.sendBtn = inputBar.createEl("button", { text: "发送", cls: "ava-send mod-cta" });
+		this.sendBtn.addEventListener("click", () => this.onSend());
+		this.stopBtn = inputBar.createEl("button", { text: "停止生成", cls: "ava-btn ava-stop" });
+		this.stopBtn.addEventListener("click", () => this.requestStop());
+		this.stopBtn.style.display = "none";
 		this.inputEl.addEventListener("keydown", (e) => {
 			if (e.key === "Enter" && !e.shiftKey) {
 				e.preventDefault();
@@ -1792,10 +1823,42 @@ class ChatView extends ItemView {
 		});
 
 		this.refreshModelSelect();
+		this.restoreHistory();
 		this.showWelcome();
 	}
 
-	async onClose() {}
+	async onClose() {
+		this.persistHistory();
+	}
+
+	restoreHistory() {
+		const saved = Array.isArray(this.plugin.settings.chatHistory) ? this.plugin.settings.chatHistory : [];
+		this.history = saved.slice(-(this.plugin.settings.maxHistoryMessages || 40));
+		if (!this.history.length || !this.msgContainer) return;
+		this.msgContainer.empty();
+		for (const m of this.history) {
+			this.addMessage(m.role === "user" ? "user" : "assistant", m.content || "");
+		}
+		this.scrollToBottom();
+	}
+
+	persistHistory() {
+		this.plugin.settings.chatHistory = this.history.slice(-(this.plugin.settings.maxHistoryMessages || 40));
+		this.plugin.saveSettings();
+	}
+
+	requestStop() {
+		this.stopping = true;
+		if (this.stopController) {
+			try { this.stopController.abort(); } catch (err) {}
+		}
+		this.setStatus("正在停止…");
+	}
+
+	setSending(on) {
+		if (this.sendBtn) this.sendBtn.disabled = !!on;
+		if (this.stopBtn) this.stopBtn.style.display = on ? "" : "none";
+	}
 
 	refreshModelSelect() {
 		if (!this.modelSelect) return;
@@ -1810,6 +1873,7 @@ class ChatView extends ItemView {
 	}
 
 	showWelcome() {
+		if (this.history && this.history.length) return;
 		this.msgContainer.empty();
 		const box = this.msgContainer.createDiv({ cls: "ava-msg ava-welcome" });
 		box.createEl("p", { text: "你好！我是 AI Vault 助手，已接入你的 cc-switch 本地代理。" });
@@ -1834,6 +1898,7 @@ class ChatView extends ItemView {
 		this.history = [];
 		this.setStatus("");
 		this.showWelcome();
+		this.persistHistory();
 	}
 
 	setStatus(text) {
@@ -1860,6 +1925,7 @@ class ChatView extends ItemView {
 	}
 
 	onSend() {
+		if (this.busy) return;
 		const text = this.inputEl.value.trim();
 		if (!text) return;
 		this.inputEl.value = "";
@@ -1876,6 +1942,10 @@ class ChatView extends ItemView {
 	}
 
 	async send(text) {
+		this.busy = true;
+		this.stopping = false;
+		this.stopController = new AbortController();
+		this.setSending(true);
 		this.setStatus("思考中…");
 		this.addMessage("user", text);
 		this.history.push({ role: "user", content: text });
@@ -1883,11 +1953,14 @@ class ChatView extends ItemView {
 		const streamTarget = bubble;
 
 		let full = "";
+		let stopped = false;
 		const onDelta = (chunk) => {
+			if (this.stopping) return false;
 			full += chunk;
 			streamTarget.empty();
 			this.renderMarkdown(full, streamTarget);
 			this.scrollToBottom();
+			return true;
 		};
 
 		try {
@@ -1900,11 +1973,13 @@ class ChatView extends ItemView {
 				round <= this.plugin.settings.maxToolRounds;
 				round++
 			) {
+				if (this.stopping) { stopped = true; break; }
 				const { content, tool_calls } = await this.plugin.streamChat(
 					messages,
-					{ model: this.plugin.settings.model },
+					{ model: this.plugin.settings.model, stopSignal: this.stopController ? this.stopController.signal : null },
 					onDelta
 				);
+				if (this.stopping) { stopped = true; break; }
 				if (
 					tool_calls &&
 					tool_calls.length &&
@@ -1912,6 +1987,7 @@ class ChatView extends ItemView {
 				) {
 					messages.push({ role: "assistant", content: content || "", tool_calls });
 					for (const tc of tool_calls) {
+						if (this.stopping) { stopped = true; break; }
 						let fnName = "";
 						let args = {};
 						try {
@@ -1924,6 +2000,7 @@ class ChatView extends ItemView {
 						const result = await this.plugin.runTool(fnName, args, {
 							confirmMode: "modal",
 						});
+						if (this.stopping) { stopped = true; break; }
 						const toolMsg = this.msgContainer.createDiv({ cls: "ava-msg ava-tool" });
 						toolMsg.createEl("span", { text: "🔧 " + fnName, cls: "ava-tool-name" });
 						toolMsg.createEl("span", {
@@ -1941,6 +2018,7 @@ class ChatView extends ItemView {
 								: toolResult,
 						});
 					}
+					if (stopped) break;
 					full = "";
 					this.setStatus("继续推理…");
 					continue;
@@ -1951,17 +2029,30 @@ class ChatView extends ItemView {
 					break;
 				}
 			}
-			this.history.push({ role: "assistant", content: full });
-			this.setStatus("");
+			if (!stopped || full) {
+				this.history.push({ role: "assistant", content: full });
+			}
+			this.setStatus(stopped ? "已停止" : "");
 			this.scrollToBottom();
+			this.persistHistory();
 		} catch (err) {
 			this.setStatus("");
-			const wrap = this.msgContainer.createDiv({ cls: "ava-msg ava-error" });
-			const bubbleErr = wrap.createEl("div", {
-				text: "请求失败: " + ((err && err.message) || err),
-				cls: "ava-bubble",
-			});
-			this.scrollToBottom();
+			if (this.stopping || /已停止/.test((err && err.message) || "")) {
+				if (full) this.history.push({ role: "assistant", content: full });
+				this.persistHistory();
+			} else {
+				const wrap = this.msgContainer.createDiv({ cls: "ava-msg ava-error" });
+				const bubbleErr = wrap.createEl("div", {
+					text: "请求失败: " + ((err && err.message) || err),
+					cls: "ava-bubble",
+				});
+				this.scrollToBottom();
+			}
+		} finally {
+			this.busy = false;
+			this.stopping = false;
+			this.stopController = null;
+			this.setSending(false);
 		}
 	}
 }

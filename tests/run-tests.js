@@ -251,6 +251,112 @@ function assert(cond, msg) {
 		assert(timedOut, "streamChatOnce 上游挂起时抛超时错误");
 	}
 
+	// DEFAULT_SETTINGS chatHistory
+	{
+		assert(Array.isArray(helpers.DEFAULT_SETTINGS.chatHistory), "DEFAULT_SETTINGS 含 chatHistory 数组");
+	}
+
+	// streamChatOnce 停止生成：onDelta 返回 false 抛已停止，不再接收后续 chunk
+	{
+		const cls = sandbox.module.exports;
+		const inst = Object.create(cls.prototype);
+		inst.settings = { aiBaseUrl: "http://127.0.0.1:15721/v1", firstTokenTimeoutMs: 5000, idleTimeoutMs: 5000, totalTimeoutMs: 10000 };
+		const encoder = new TextEncoder();
+		const chunks = [
+			encoder.encode('data: {"choices":[{"delta":{"content":"一"}}]}\n\n'),
+			encoder.encode('data: {"choices":[{"delta":{"content":"二"}}]}\n\n'),
+			encoder.encode("data: [DONE]\n\n"),
+		];
+		let i = 0;
+		const stream = new ReadableStream({
+			pull(controller) {
+				if (i < chunks.length) controller.enqueue(chunks[i++]);
+				else controller.close();
+			},
+		});
+		sandbox.fetch = async () => ({ ok: true, status: 200, text: async () => "", body: { getReader: () => stream.getReader() } });
+		let got = "";
+		let stopped = false;
+		try {
+			await inst.streamChatOnce({ model: "m", messages: [] }, (c) => { got += c; return false; });
+		} catch (e) {
+			stopped = /已停止/.test(e.message);
+		}
+		assert(stopped, "streamChatOnce 停止生成抛已停止");
+		assert(got === "一", "streamChatOnce 停止后不再接收后续 chunk");
+	}
+
+	// streamChat 停止信号已触发：不发起请求、不重试
+	{
+		const cls = sandbox.module.exports;
+		const inst = Object.create(cls.prototype);
+		inst.settings = { aiBaseUrl: "http://127.0.0.1:15721/v1", firstTokenTimeoutMs: 5000, idleTimeoutMs: 5000, totalTimeoutMs: 10000, maxTokens: 16, temperature: 0.3, enableTools: false, aiConcurrentLimit: 2 };
+		const ac = new AbortController();
+		ac.abort();
+		let fetches = 0;
+		sandbox.fetch = async () => { fetches++; return { ok: true, status: 200, text: async () => "", body: { getReader: () => ({ read: async () => ({ done: true, value: undefined }) }) } }; };
+		let stopped = false;
+		try {
+			await inst.streamChat([{ role: "user", content: "a" }], { tools: false, stopSignal: ac.signal });
+		} catch (e) {
+			stopped = /已停止/.test(e.message);
+		}
+		assert(stopped && fetches === 0, "streamChat 已停止信号不发起请求且抛已停止");
+	}
+
+	// streamChat 停止后不重试（onDelta 返回 false 触发停止，只请求 1 次）
+	{
+		const cls = sandbox.module.exports;
+		const inst = Object.create(cls.prototype);
+		inst.settings = { aiBaseUrl: "http://127.0.0.1:15721/v1", firstTokenTimeoutMs: 5000, idleTimeoutMs: 5000, totalTimeoutMs: 10000, maxTokens: 16, temperature: 0.3, enableTools: false, aiConcurrentLimit: 2 };
+		const encoder = new TextEncoder();
+		const chunks = [
+			encoder.encode('data: {"choices":[{"delta":{"content":"一"}}]}\n\n'),
+			encoder.encode('data: {"choices":[{"delta":{"content":"二"}}]}\n\n'),
+			encoder.encode("data: [DONE]\n\n"),
+		];
+		let i = 0;
+		const stream = new ReadableStream({
+			pull(controller) {
+				if (i < chunks.length) controller.enqueue(chunks[i++]);
+				else controller.close();
+			},
+		});
+		let fetches = 0;
+		sandbox.fetch = async () => { fetches++; return { ok: true, status: 200, text: async () => "", body: { getReader: () => stream.getReader() } }; };
+		let stopped = false;
+		try {
+			await inst.streamChat([{ role: "user", content: "a" }], { tools: false }, () => false);
+		} catch (e) {
+			stopped = /已停止/.test(e.message);
+		}
+		assert(stopped && fetches === 1, "streamChat 停止后不重试（只请求 1 次）");
+	}
+
+	// 正常 onDelta 返回 true 时流式继续拼接
+	{
+		const cls = sandbox.module.exports;
+		const inst = Object.create(cls.prototype);
+		inst.settings = { aiBaseUrl: "http://127.0.0.1:15721/v1", firstTokenTimeoutMs: 5000, idleTimeoutMs: 5000, totalTimeoutMs: 10000 };
+		const encoder = new TextEncoder();
+		const chunks = [
+			encoder.encode('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'),
+			encoder.encode('data: {"choices":[{"delta":{"content":"b"}}]}\n\n'),
+			encoder.encode("data: [DONE]\n\n"),
+		];
+		let i = 0;
+		const stream = new ReadableStream({
+			pull(controller) {
+				if (i < chunks.length) controller.enqueue(chunks[i++]);
+				else controller.close();
+			},
+		});
+		sandbox.fetch = async () => ({ ok: true, status: 200, text: async () => "", body: { getReader: () => stream.getReader() } });
+		let out = "";
+		const res = await inst.streamChatOnce({ model: "m", messages: [] }, (c) => { out += c; return true; });
+		assert(res.content === "ab" && out === "ab", "streamChatOnce onDelta 返回 true 正常拼接");
+	}
+
 	console.log("\n结果: " + passed + " 通过, " + failed + " 失败");
 	process.exit(failed ? 1 : 0);
 })();

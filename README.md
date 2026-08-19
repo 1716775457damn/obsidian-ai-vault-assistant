@@ -8,7 +8,7 @@
    - 自动探测 `~/.cc-switch`（settings.json + cc-switch.db），读取本地代理地址、当前 Provider 信息。
    - AI 请求走 cc-switch 本地代理 `http://127.0.0.1:15721/v1`（默认端口，可在设置里改），无需手动配置 API Key。
    - 模型下拉 = 代理 `/models` + cc-switch.db 中配置过的模型 + 内置 189 个模型目录 + 自定义模型（可直接输入）。
-   - 支持流式输出；免费上游偶发 502 会自动重试 3 次。
+   - 支持流式输出；免费上游偶发 502 会自动重试 3 次；生成过程中可随时点击「停止生成」。
 
 2. **读取全部文件 + 读取其他插件与命令**
    - 可读取/搜索/创建/修改库内任意文件（markdown、JSON、附件统计）。
@@ -20,7 +20,7 @@
    - 内置本地 HTTP MCP 服务（默认 `127.0.0.1:33157/mcp`，Bearer Token 鉴权），暴露 15 个工具，供 **Codex** 等外部 Agent 接入。
 
 4. **对话界面：整理、互链、装插件、改配置**
-   - Ribbon 图标 / 命令面板打开对话视图；支持 Markdown 渲染与流式打字效果。
+   - Ribbon 图标 / 命令面板打开对话视图；支持 Markdown 渲染与流式打字效果；对话历史自动保存，重开界面自动恢复（点「新会话」清空）。
    - AI 可整理文件、生成 MOC、为笔记建立双链、分析全库。
    - 搜索推荐社区插件并（确认后）从 GitHub Release 安装。
    - 读取/推荐插件配置，展示 diff，**用户确认后**写入 data.json。
@@ -74,7 +74,7 @@ codex mcp add ai-vault-assistant --type http --url http://127.0.0.1:33157/mcp --
 
 ## 常见问题
 
-- **AI 连接失败 / 502**：免费上游会间歇性 502（`Upstream access forbidden`）。插件会自动重试；也可以在 cc-switch 里切换 provider 或换模型。
+- **AI 连接失败 / 502**：免费上游会间歇性 502（`Upstream access forbidden`）。插件会自动重试；也可以在 cc-switch 里切换 provider 或换模型。生成卡住时可按「停止生成」中断后重发。
 - **模型 404（Model not supported）**：必须使用当前 provider 真正支持的模型名。打开“刷新模型列表”可从 cc-switch.db 提取配置过的模型。
 - **找不到 MCP token**：插件设置 → MCP 服务 → 访问 Token → 复制/重新生成。
 - **MCP 端口被占用**：在设置里改端口（默认 33157）后重新启用。
